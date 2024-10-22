@@ -36,10 +36,6 @@ real_t *d_U_prv, *d_U_cur, *d_U_nxt;
 #define d_U(i,j)     d_U_cur[1][((i)+1)*(N+2)+(j)+1]
 #define d_U_nxt(i,j) d_U_nxt[2][((i)+1)*(N+2)+(j)+1]
 
-// Declare the grid dimensions as constants on the device
-__constant__ int_t d_N;
-__constant__ int_t d_M;
-
 // Simulation parameters: size, step count, and how often to save the state
 int_t
     N = 128,
@@ -54,6 +50,15 @@ const real_t
     dy = 1.0;
 real_t
     dt;
+
+// Declare the grid dimensions as constants on the device
+// Since we don't specify grid dimensions as arguments when running the program,
+// we could just set them as constexpr variables on the host side, but I used __constant__ memory instead
+// to use more CUDA features.
+__constant__ int_t d_N;
+__constant__ int_t d_M;
+
+__constant__ real_t d_dt, d_c, d_dx, d_dy;
 
 // We only need the current time step on the host side
 real_t *h_U_cur;
@@ -100,12 +105,39 @@ void domain_save ( int_t step )
 void domain_finalize ( void )
 {
 // BEGIN: T4
-    free ( buffers[0] );
-    free ( buffers[1] );
-    free ( buffers[2] );
+    // Free the host memory
+    free(h_U_cur);
+
+    // Free the device memory
+    cudaFree(d_U_prv);
+    cudaFree(d_U_cur);
+    cudaFree(d_U_nxt);
+    cudaFree(&d_N);
+    cudaFree(&d_M);
 // END: T4
 }
 
+// __device__ function for handling boundary conditions
+__device__ void apply_boundary_conditions(real_t *shared_U, int i, int j, int local_i, int local_j, int shared_block_size_x, int shared_block_size_y, int d_M, int d_N) {
+    // Neumann boundary conditions for shared memory
+    // Handle the boundaries only within valid thread ranges
+    
+    // Apply boundary conditions to the left and right edges
+    if (local_j == 1 && j > 0) {
+        shared_U[local_i * shared_block_size_y] = shared_U[local_i * shared_block_size_y + 1];
+    }
+    if (local_j == shared_block_size_y - 2 && j < d_N - 1) {
+        shared_U[local_i * shared_block_size_y + (shared_block_size_y - 1)] = shared_U[local_i * shared_block_size_y + (shared_block_size_y - 2)];
+    }
+    
+    // Apply boundary conditions to the top and bottom edges
+    if (local_i == 1 && i > 0) {
+        shared_U[0 * shared_block_size_y + local_j] = shared_U[1 * shared_block_size_y + local_j];
+    }
+    if (local_i == shared_block_size_x - 2 && i < d_M - 1) {
+        shared_U[(shared_block_size_x - 1) * shared_block_size_y + local_j] = shared_U[(shared_block_size_x - 2) * shared_block_size_y + local_j];
+    }
+}
 
 // TASK: T6
 // Neumann (reflective) boundary condition
@@ -127,10 +159,70 @@ void boundary_condition ( void )
 
 
 // TASK: T5
+__global__ void time_step_kernel(real_t *d_U_prv, real_t *d_U_cur, real_t *d_U_nxt) {
+    // Define a shared memory tile with extra space for halo (boundary) elements
+    extern __shared__ real_t shared_U[];
+
+    // Calculate the global indices
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    int j = blockIdx.y * blockDim.y + threadIdx.y;
+
+    // Calculate local indices in shared memory
+    int local_i = threadIdx.x + 1;
+    int local_j = threadIdx.y + 1;
+
+    // Get the dimensions of the block
+    int shared_block_size_x = blockDim.x + 2; // +2 for the halo regions
+    int shared_block_size_y = blockDim.y + 2; // +2 for the halo regions
+
+    // Load current cell into shared memory
+    if (i < d_M && j < d_N) {
+        shared_U[local_i * shared_block_size_y + local_j] = d_U_cur[i * (d_N + 2) + j];
+
+        // Load the halo cells (boundary values)
+        if (threadIdx.x == 0 && i > 0) {
+            shared_U[(local_i - 1) * shared_block_size_y + local_j] = d_U_cur[(i - 1) * (d_N + 2) + j];
+        }
+        if (threadIdx.x == blockDim.x - 1 && i < d_M - 1) {
+            shared_U[(local_i + 1) * shared_block_size_y + local_j] = d_U_cur[(i + 1) * (d_N + 2) + j];
+        }
+        if (threadIdx.y == 0 && j > 0) {
+            shared_U[local_i * shared_block_size_y + (local_j - 1)] = d_U_cur[i * (d_N + 2) + (j - 1)];
+        }
+        if (threadIdx.y == blockDim.y - 1 && j < d_N - 1) {
+            shared_U[local_i * shared_block_size_y + (local_j + 1)] = d_U_cur[i * (d_N + 2) + (j + 1)];
+        }
+    }
+
+    // Synchronize to make sure all threads have loaded their data into shared memory
+    __syncthreads();
+
+    // Apply boundary conditions using the __device__ function
+    apply_boundary_conditions(shared_U, i, j, local_i, local_j, shared_block_size_x, shared_block_size_y, d_M, d_N);
+
+    // Synchronize again to ensure boundary conditions are applied before computation
+    __syncthreads();
+
+    // Perform the calculation if within bounds
+    if (i < d_M && j < d_N) {
+        d_U_nxt[i * (d_N + 2) + j] = -d_U_prv[i * (d_N + 2) + j] + 2.0 * shared_U[local_i * shared_block_size_y + local_j]
+            + (d_dt * d_dt * d_c * d_c) / (d_dx * d_dy) * (
+                shared_U[(local_i - 1) * shared_block_size_y + local_j] +
+                shared_U[(local_i + 1) * shared_block_size_y + local_j] +
+                shared_U[local_i * shared_block_size_y + (local_j - 1)] +
+                shared_U[local_i * shared_block_size_y + (local_j + 1)] -
+                4.0 * shared_U[local_i * shared_block_size_y + local_j]
+            );
+    }
+}
 // Integration formula
 // BEGIN; T5
 void time_step ( void )
 {
+
+    
+    
+
     for ( int_t i=0; i<M; i++ )
     {
         for ( int_t j=0; j<N; j++ )
@@ -237,7 +329,7 @@ void domain_initialize ( void )
     }
 
     // We only need the current time step on the host
-    buffers[1] = (real_t *) malloc ( (M+2)*(N+2)*sizeof(real_t) );
+    h_U_cur = (real_t *) malloc ( (M+2)*(N+2)*sizeof(real_t) );
 
     for ( int_t i=0; i<M; i++ )
     {
@@ -246,9 +338,12 @@ void domain_initialize ( void )
             // Calculate delta (radial distance) adjusted for M x N grid
             real_t delta = sqrt ( ((i - M/2.0) * (i - M/2.0)) / (real_t)M +
                                 ((j - N/2.0) * (j - N/2.0)) / (real_t)N );
-            U(i,j) = exp ( -4.0*delta*delta );
+            h_U(i,j) = exp ( -4.0*delta*delta );
         }
     }
+
+    // Set the time step for 2D case
+    dt = dx*dy / (c * sqrt (dx*dx+dy*dy));
 
     // Allocate device memory for the three time steps
     cudaErrorCheck(cudaMalloc((void **)&d_U_prv, (M+2)*(N+2)*sizeof(real_t)));
@@ -266,8 +361,12 @@ void domain_initialize ( void )
     cudaErrorCheck(cudaMemcpyToSymbol(d_N, &N, sizeof(int_t)));
     cudaErrorCheck(cudaMemcpyToSymbol(d_M, &M, sizeof(int_t)));
 
-    // Set the time step for 2D case
-    dt = dx*dy / (c * sqrt (dx*dx+dy*dy));
+    // Copy the wave equation parameters to the device constant memory using cudaMemcpyToSymbol
+    cudaErrorCheck(cudaMemcpyToSymbol(d_dt, &dt, sizeof(real_t)));
+    cudaErrorCheck(cudaMemcpyToSymbol(d_c, &c, sizeof(real_t)));
+    cudaErrorCheck(cudaMemcpyToSymbol(d_dx, &dx, sizeof(real_t)));
+    cudaErrorCheck(cudaMemcpyToSymbol(d_dy, &dy, sizeof(real_t)));
+
 // END: T3
 }
 
