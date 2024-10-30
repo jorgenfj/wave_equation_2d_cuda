@@ -32,9 +32,14 @@ cudaDeviceProp device_prop;
 // Device buffers for three time steps, indexed with 2 ghost points for the boundary
 real_t *d_U_prv, *d_U_cur, *d_U_nxt;
 
-#define d_U_prv(i,j) d_U_prev[0][((i)+1)*(N+2)+(j)+1]
-#define d_U(i,j)     d_U_cur[1][((i)+1)*(N+2)+(j)+1]
-#define d_U_nxt(i,j) d_U_nxt[2][((i)+1)*(N+2)+(j)+1]
+// Can't index past the ghost points, because device only allows
+// indexing with unsigned ints
+#define D_U_PRV(i,j) d_U_prv[((i))*(N+2)+(j)]
+#define D_U_CUR(i,j)     d_U_cur[((i))*(N+2)+(j)]
+#define D_U_NXT(i,j) d_U_nxt[((i))*(N+2)+(j)]
+
+#define GHOST(x) x + 1
+
 
 // Simulation parameters: size, step count, and how often to save the state
 int_t
@@ -75,14 +80,11 @@ inline void gpuAssert(cudaError_t code, const char *file, int line, bool abort=t
     }
 }
 
-
-// Rotate the time step buffers.
-void move_buffer_window ( void )
-{
-    real_t *temp = buffers[0];
-    buffers[0] = buffers[1];
-    buffers[1] = buffers[2];
-    buffers[2] = temp;
+void move_buffer_window(real_t*& d_U_prv, real_t*& d_U_cur, real_t*& d_U_nxt) {
+    real_t* temp = d_U_prv;
+    d_U_prv = d_U_cur;
+    d_U_cur = d_U_nxt;
+    d_U_nxt = temp;
 }
 
 
@@ -94,7 +96,7 @@ void domain_save ( int_t step )
     FILE *out = fopen ( filename, "wb" );
     for ( int_t i=0; i<M; i++ )
     {
-        fwrite ( &U(i,0), sizeof(real_t), N, out );
+        fwrite ( &h_U(i,0), sizeof(real_t), N, out );
     }
     fclose ( out );
 }
@@ -112,126 +114,97 @@ void domain_finalize ( void )
     cudaFree(d_U_prv);
     cudaFree(d_U_cur);
     cudaFree(d_U_nxt);
-    cudaFree(&d_N);
-    cudaFree(&d_M);
 // END: T4
 }
 
-// __device__ function for handling boundary conditions
-__device__ void apply_boundary_conditions(real_t *shared_U, int i, int j, int local_i, int local_j, int shared_block_size_x, int shared_block_size_y, int d_M, int d_N) {
-    // Neumann boundary conditions for shared memory
-    // Handle the boundaries only within valid thread ranges
-    
-    // Apply boundary conditions to the left and right edges
-    if (local_j == 1 && j > 0) {
-        shared_U[local_i * shared_block_size_y] = shared_U[local_i * shared_block_size_y + 1];
+// TASK: T6
+// __device__ void apply_boundary_conditions_global(real_t *d_U_cur, int global_i, int global_j) {
+//     // Neumann (reflective) boundary condition
+//     if (global_j == 0) {
+//         D_U_CUR(global_i + 1,0) = D_U_CUR(global_i+1,2);
+//     }
+//     if (global_j == d_N - 1) {
+//         D_U_CUR(global_i+1,d_N+1) = D_U_CUR(global_i+1,d_N-1);
+//     }
+//     if (global_i == 0) {
+//         D_U_CUR(0,global_j +1) = D_U_CUR(2,global_j+1);
+//     }
+//     if (global_i == d_M - 1) {
+//         D_U_CUR(d_M+1,global_j+1) = D_U_CUR(d_M-1,global_j+1);
+//     }
+// }
+// Updated boundary conditions function to accept constants as arguments
+__device__ void apply_boundary_conditions_global(real_t *d_U_cur, int global_i, int global_j, int N, int M) {
+    // Neumann (reflective) boundary condition
+    if (global_j == 0) {
+        D_U_CUR(global_i + 1, 0) = D_U_CUR(global_i + 1, 2);
     }
-    if (local_j == shared_block_size_y - 2 && j < d_N - 1) {
-        shared_U[local_i * shared_block_size_y + (shared_block_size_y - 1)] = shared_U[local_i * shared_block_size_y + (shared_block_size_y - 2)];
+    if (global_j == N - 1) {
+        D_U_CUR(global_i + 1, N + 1) = D_U_CUR(global_i + 1, N - 1);
     }
-    
-    // Apply boundary conditions to the top and bottom edges
-    if (local_i == 1 && i > 0) {
-        shared_U[0 * shared_block_size_y + local_j] = shared_U[1 * shared_block_size_y + local_j];
+    if (global_i == 0) {
+        D_U_CUR(0, global_j + 1) = D_U_CUR(2, global_j + 1);
     }
-    if (local_i == shared_block_size_x - 2 && i < d_M - 1) {
-        shared_U[(shared_block_size_x - 1) * shared_block_size_y + local_j] = shared_U[(shared_block_size_x - 2) * shared_block_size_y + local_j];
+    if (global_i == M - 1) {
+        D_U_CUR(M + 1, global_j + 1) = D_U_CUR(M - 1, global_j + 1);
     }
 }
 
-// TASK: T6
-// Neumann (reflective) boundary condition
-// BEGIN: T6
-void boundary_condition ( void )
-{
-    for ( int_t i=0; i<M; i++ )
-    {
-        U(i,-1) = U(i,1);
-        U(i,N)  = U(i,N-2);
-    }
-    for ( int_t j=0; j<N; j++ )
-    {
-        U(-1,j) = U(1,j);
-        U(M,j)  = U(M-2,j);
-    }
-}
 // END: T6
 
 
+
 // TASK: T5
-__global__ void time_step_kernel(real_t *d_U_prv, real_t *d_U_cur, real_t *d_U_nxt) {
-    // Define a shared memory tile with extra space for halo (boundary) elements
-    extern __shared__ real_t shared_U[];
+// __global__ void time_step_kernel(real_t* d_U_prv, real_t* d_U_cur, real_t* d_U_nxt) {
 
-    // Calculate the global indices
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    int j = blockIdx.y * blockDim.y + threadIdx.y;
+//     // Calculate the global and local indices
+//     int global_i = blockIdx.x * blockDim.x + threadIdx.x;
+//     int global_j = blockIdx.y * blockDim.y + threadIdx.y;
 
-    // Calculate local indices in shared memory
-    int local_i = threadIdx.x + 1;
-    int local_j = threadIdx.y + 1;
+//     // if (global_i == 0) {
+//     //     D_U_CUR(0,GHOST(global_j)) = D_U_CUR(2,GHOST(global_j));
+//     // }
+//     // if (global_i == d_M - 1) {
+//     //     D_U_CUR(d_M+1,GHOST(global_j)) = D_U_CUR(d_M-1,GHOST(global_j));
+//     // }
+//     // if (global_j == 0) {
+//     //     D_U_CUR(GHOST(global_i),0) = D_U_CUR(GHOST(global_i),2);
+//     // }
+//     // if (global_j == d_N - 1) {
+//     //     D_U_CUR(GHOST(global_i),d_N+1) = D_U_CUR(GHOST(global_i),d_N-1);
+//     // }
 
-    // Get the dimensions of the block
-    int shared_block_size_x = blockDim.x + 2; // +2 for the halo regions
-    int shared_block_size_y = blockDim.y + 2; // +2 for the halo regions
+//     apply_boundary_conditions_global(d_U_cur, global_i, global_j);
 
-    // Load current cell into shared memory
-    if (i < d_M && j < d_N) {
-        shared_U[local_i * shared_block_size_y + local_j] = d_U_cur[i * (d_N + 2) + j];
+//     // apply_boundary_conditions_global(d_U_cur, global_i, global_j);
+//     __syncthreads();
 
-        // Load the halo cells (boundary values)
-        if (threadIdx.x == 0 && i > 0) {
-            shared_U[(local_i - 1) * shared_block_size_y + local_j] = d_U_cur[(i - 1) * (d_N + 2) + j];
-        }
-        if (threadIdx.x == blockDim.x - 1 && i < d_M - 1) {
-            shared_U[(local_i + 1) * shared_block_size_y + local_j] = d_U_cur[(i + 1) * (d_N + 2) + j];
-        }
-        if (threadIdx.y == 0 && j > 0) {
-            shared_U[local_i * shared_block_size_y + (local_j - 1)] = d_U_cur[i * (d_N + 2) + (j - 1)];
-        }
-        if (threadIdx.y == blockDim.y - 1 && j < d_N - 1) {
-            shared_U[local_i * shared_block_size_y + (local_j + 1)] = d_U_cur[i * (d_N + 2) + (j + 1)];
-        }
-    }
+//     if (global_i < d_M && global_j < d_N) {
+//         D_U_NXT(global_i+1, global_j+1) = -D_U_PRV(global_i+1,global_j+1) + 2.0 * D_U_CUR(global_i+1,global_j+1)
+//             + (d_dt * d_dt * d_c * d_c) / (d_dx * d_dy) * (
+//                 D_U_CUR(global_i, global_j+1) + D_U_CUR(global_i+2, global_j+1) +
+//                 D_U_CUR(global_i+1, global_j) + D_U_CUR(global_i +1, global_j+2) - 4.0 * D_U_CUR(global_i+1, global_j+1)
+//             );
+//     }
+// }
+// Updated time_step_kernel to accept constants as arguments
+__global__ void time_step_kernel(real_t* d_U_prv, real_t* d_U_cur, real_t* d_U_nxt,
+                                 int N, int M, real_t dt, real_t c, real_t dx, real_t dy) {
 
-    // Synchronize to make sure all threads have loaded their data into shared memory
+    int global_i = blockIdx.x * blockDim.x + threadIdx.x;
+    int global_j = blockIdx.y * blockDim.y + threadIdx.y;
+
+    // Apply boundary conditions
+    apply_boundary_conditions_global(d_U_cur, global_i, global_j, N, M);
     __syncthreads();
 
-    // Apply boundary conditions using the __device__ function
-    apply_boundary_conditions(shared_U, i, j, local_i, local_j, shared_block_size_x, shared_block_size_y, d_M, d_N);
-
-    // Synchronize again to ensure boundary conditions are applied before computation
-    __syncthreads();
-
-    // Perform the calculation if within bounds
-    if (i < d_M && j < d_N) {
-        d_U_nxt[i * (d_N + 2) + j] = -d_U_prv[i * (d_N + 2) + j] + 2.0 * shared_U[local_i * shared_block_size_y + local_j]
-            + (d_dt * d_dt * d_c * d_c) / (d_dx * d_dy) * (
-                shared_U[(local_i - 1) * shared_block_size_y + local_j] +
-                shared_U[(local_i + 1) * shared_block_size_y + local_j] +
-                shared_U[local_i * shared_block_size_y + (local_j - 1)] +
-                shared_U[local_i * shared_block_size_y + (local_j + 1)] -
-                4.0 * shared_U[local_i * shared_block_size_y + local_j]
+    // Perform the time step calculation
+    if (global_i < M && global_j < N) {
+        D_U_NXT(global_i + 1, global_j + 1) = -D_U_PRV(global_i + 1, global_j + 1) + 2.0 * D_U_CUR(global_i + 1, global_j + 1)
+            + (dt * dt * c * c) / (dx * dy) * (
+                D_U_CUR(global_i, global_j + 1) + D_U_CUR(global_i + 2, global_j + 1) +
+                D_U_CUR(global_i + 1, global_j) + D_U_CUR(global_i + 1, global_j + 2) - 4.0 * D_U_CUR(global_i + 1, global_j + 1)
             );
-    }
-}
-// Integration formula
-// BEGIN; T5
-void time_step ( void )
-{
-
-    
-    
-
-    for ( int_t i=0; i<M; i++ )
-    {
-        for ( int_t j=0; j<N; j++ )
-        {
-            U_nxt(i,j) = -U_prv(i,j) + 2.0*U(i,j)
-                     + (dt*dt*c*c)/(dx*dy) * (
-                        U(i-1,j)+U(i+1,j)+U(i,j-1)+U(i,j+1)-4.0*U(i,j)
-                     );
-        }
     }
 }
 // END: T5
@@ -239,26 +212,50 @@ void time_step ( void )
 
 // TASK: T7
 // Main time integration.
-void simulate( void )
-{
-// BEGIN: T7
-    // Go through each time step
-    for ( int_t iteration=0; iteration<=max_iteration; iteration++ )
-    {
-        if ( (iteration % snapshot_freq)==0 )
-        {
-            domain_save ( iteration / snapshot_freq );
+// void simulate(void) {
+//     // Define block and grid dimensions for the kernel
+//     dim3 blockDim(16, 16);
+//     dim3 gridDim((N + blockDim.x - 1) / blockDim.x, (M + blockDim.y - 1) / blockDim.y);
+
+//     // Go through each time step
+//     for ( int_t iteration=0; iteration<=max_iteration; iteration++ )
+//     {
+//         if ( (iteration % snapshot_freq)==0 )
+//         {
+//             domain_save ( iteration / snapshot_freq );
+//         }
+
+//         time_step_kernel<<<gridDim, blockDim>>>(d_U_prv, d_U_cur, d_U_nxt);
+
+//         cudaDeviceSynchronize();
+//         cudaMemcpy(h_U_cur, d_U_nxt, (M+2)*(N+2)*sizeof(real_t), cudaMemcpyDeviceToHost);
+//         cudaDeviceSynchronize();
+//         move_buffer_window(d_U_prv, d_U_cur, d_U_nxt);
+//     }
+// }
+void simulate(void) {
+    dim3 blockDim(16, 16);
+    dim3 gridDim((N + blockDim.x - 1) / blockDim.x, (M + blockDim.y - 1) / blockDim.y);
+
+    for (int_t iteration = 0; iteration <= max_iteration; iteration++) {
+        if ((iteration % snapshot_freq) == 0) {
+            domain_save(iteration / snapshot_freq);
         }
 
-        // Derive step t+1 from steps t and t-1
-        boundary_condition();
-        time_step();
+        // Launch the kernel with constants as arguments
+        time_step_kernel<<<gridDim, blockDim>>>(
+            d_U_prv, d_U_cur, d_U_nxt,
+            N, M, dt, c, dx, dy
+        );
 
-        // Rotate the time step buffers
-        move_buffer_window();
+        cudaDeviceSynchronize();
+        cudaMemcpy(h_U_cur, d_U_nxt, (M + 2) * (N + 2) * sizeof(real_t), cudaMemcpyDeviceToHost);
+        cudaDeviceSynchronize();
+        move_buffer_window(d_U_prv, d_U_cur, d_U_nxt);
     }
-// END: T7
 }
+// END: T7
+
 
 
 // TASK: T8
@@ -353,9 +350,6 @@ void domain_initialize ( void )
     // Copy the initial conditions from host to device for d_U_prv and d_U_cur
     cudaErrorCheck(cudaMemcpy(d_U_prv, h_U_cur, (M+2)*(N+2)*sizeof(real_t), cudaMemcpyHostToDevice));
     cudaErrorCheck(cudaMemcpy(d_U_cur, h_U_cur, (M+2)*(N+2)*sizeof(real_t), cudaMemcpyHostToDevice));
-
-    cudaErrorCheck(cudaMalloc((void **)&d_N, sizeof(int_t)));
-    cudaErrorCheck(cudaMalloc((void **)&d_M, sizeof(int_t)));
 
     // Copy the grid size constants to the device constant memory using cudaMemcpyToSymbol
     cudaErrorCheck(cudaMemcpyToSymbol(d_N, &N, sizeof(int_t)));
