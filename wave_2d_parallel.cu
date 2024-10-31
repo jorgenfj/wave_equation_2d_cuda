@@ -34,12 +34,9 @@ real_t *d_U_prv, *d_U_cur, *d_U_nxt;
 
 // Can't index past the ghost points, because device only allows
 // indexing with unsigned ints
-#define D_U_PRV(i,j) d_U_prv[((i))*(N+2)+(j)]
-#define D_U_CUR(i,j)     d_U_cur[((i))*(N+2)+(j)]
-#define D_U_NXT(i,j) d_U_nxt[((i))*(N+2)+(j)]
-
-#define GHOST(x) x + 1
-
+#define D_U_PRV(i,j) d_U_prv[((i+1))*(N+2)+(j+1)]
+#define D_U_CUR(i,j)     d_U_cur[((i+1))*(N+2)+(j+1)]
+#define D_U_NXT(i,j) d_U_nxt[((i+1))*(N+2)+(j+1)]
 
 // Simulation parameters: size, step count, and how often to save the state
 int_t
@@ -80,7 +77,7 @@ inline void gpuAssert(cudaError_t code, const char *file, int line, bool abort=t
     }
 }
 
-void move_buffer_window(real_t*& d_U_prv, real_t*& d_U_cur, real_t*& d_U_nxt) {
+void move_buffer_window( void ) {
     real_t* temp = d_U_prv;
     d_U_prv = d_U_cur;
     d_U_cur = d_U_nxt;
@@ -118,35 +115,21 @@ void domain_finalize ( void )
 }
 
 // TASK: T6
-// __device__ void apply_boundary_conditions_global(real_t *d_U_cur, int global_i, int global_j) {
-//     // Neumann (reflective) boundary condition
-//     if (global_j == 0) {
-//         D_U_CUR(global_i + 1,0) = D_U_CUR(global_i+1,2);
-//     }
-//     if (global_j == d_N - 1) {
-//         D_U_CUR(global_i+1,d_N+1) = D_U_CUR(global_i+1,d_N-1);
-//     }
-//     if (global_i == 0) {
-//         D_U_CUR(0,global_j +1) = D_U_CUR(2,global_j+1);
-//     }
-//     if (global_i == d_M - 1) {
-//         D_U_CUR(d_M+1,global_j+1) = D_U_CUR(d_M-1,global_j+1);
-//     }
-// }
-// Updated boundary conditions function to accept constants as arguments
 __device__ void apply_boundary_conditions_global(real_t *d_U_cur, int global_i, int global_j, int N, int M) {
     // Neumann (reflective) boundary condition
+     if (global_i < M && global_j < N) {
     if (global_j == 0) {
-        D_U_CUR(global_i + 1, 0) = D_U_CUR(global_i + 1, 2);
+        D_U_CUR(global_i, global_j -1) = D_U_CUR(global_i, global_j + 1);
     }
     if (global_j == N - 1) {
-        D_U_CUR(global_i + 1, N + 1) = D_U_CUR(global_i + 1, N - 1);
+        D_U_CUR(global_i, N) = D_U_CUR(global_i, N - 2);
     }
     if (global_i == 0) {
-        D_U_CUR(0, global_j + 1) = D_U_CUR(2, global_j + 1);
+        D_U_CUR(global_i-1, global_j) = D_U_CUR(global_i+1, global_j);
     }
     if (global_i == M - 1) {
-        D_U_CUR(M + 1, global_j + 1) = D_U_CUR(M - 1, global_j + 1);
+        D_U_CUR(M, global_j) = D_U_CUR(M - 2, global_j);
+    }
     }
 }
 
@@ -155,39 +138,6 @@ __device__ void apply_boundary_conditions_global(real_t *d_U_cur, int global_i, 
 
 
 // TASK: T5
-// __global__ void time_step_kernel(real_t* d_U_prv, real_t* d_U_cur, real_t* d_U_nxt) {
-
-//     // Calculate the global and local indices
-//     int global_i = blockIdx.x * blockDim.x + threadIdx.x;
-//     int global_j = blockIdx.y * blockDim.y + threadIdx.y;
-
-//     // if (global_i == 0) {
-//     //     D_U_CUR(0,GHOST(global_j)) = D_U_CUR(2,GHOST(global_j));
-//     // }
-//     // if (global_i == d_M - 1) {
-//     //     D_U_CUR(d_M+1,GHOST(global_j)) = D_U_CUR(d_M-1,GHOST(global_j));
-//     // }
-//     // if (global_j == 0) {
-//     //     D_U_CUR(GHOST(global_i),0) = D_U_CUR(GHOST(global_i),2);
-//     // }
-//     // if (global_j == d_N - 1) {
-//     //     D_U_CUR(GHOST(global_i),d_N+1) = D_U_CUR(GHOST(global_i),d_N-1);
-//     // }
-
-//     apply_boundary_conditions_global(d_U_cur, global_i, global_j);
-
-//     // apply_boundary_conditions_global(d_U_cur, global_i, global_j);
-//     __syncthreads();
-
-//     if (global_i < d_M && global_j < d_N) {
-//         D_U_NXT(global_i+1, global_j+1) = -D_U_PRV(global_i+1,global_j+1) + 2.0 * D_U_CUR(global_i+1,global_j+1)
-//             + (d_dt * d_dt * d_c * d_c) / (d_dx * d_dy) * (
-//                 D_U_CUR(global_i, global_j+1) + D_U_CUR(global_i+2, global_j+1) +
-//                 D_U_CUR(global_i+1, global_j) + D_U_CUR(global_i +1, global_j+2) - 4.0 * D_U_CUR(global_i+1, global_j+1)
-//             );
-//     }
-// }
-// Updated time_step_kernel to accept constants as arguments
 __global__ void time_step_kernel(real_t* d_U_prv, real_t* d_U_cur, real_t* d_U_nxt,
                                  int N, int M, real_t dt, real_t c, real_t dx, real_t dy) {
 
@@ -200,45 +150,27 @@ __global__ void time_step_kernel(real_t* d_U_prv, real_t* d_U_cur, real_t* d_U_n
 
     // Perform the time step calculation
     if (global_i < M && global_j < N) {
-        D_U_NXT(global_i + 1, global_j + 1) = -D_U_PRV(global_i + 1, global_j + 1) + 2.0 * D_U_CUR(global_i + 1, global_j + 1)
+        D_U_NXT(global_i, global_j) = -D_U_PRV(global_i, global_j) + 2.0 * D_U_CUR(global_i, global_j)
             + (dt * dt * c * c) / (dx * dy) * (
-                D_U_CUR(global_i, global_j + 1) + D_U_CUR(global_i + 2, global_j + 1) +
-                D_U_CUR(global_i + 1, global_j) + D_U_CUR(global_i + 1, global_j + 2) - 4.0 * D_U_CUR(global_i + 1, global_j + 1)
+                D_U_CUR(global_i-1, global_j) + D_U_CUR(global_i + 1, global_j) +
+                D_U_CUR(global_i, global_j-1) + D_U_CUR(global_i, global_j + 1) - 4.0 * D_U_CUR(global_i, global_j)
             );
     }
+    __syncthreads();
 }
 // END: T5
 
-
 // TASK: T7
-// Main time integration.
-// void simulate(void) {
-//     // Define block and grid dimensions for the kernel
-//     dim3 blockDim(16, 16);
-//     dim3 gridDim((N + blockDim.x - 1) / blockDim.x, (M + blockDim.y - 1) / blockDim.y);
-
-//     // Go through each time step
-//     for ( int_t iteration=0; iteration<=max_iteration; iteration++ )
-//     {
-//         if ( (iteration % snapshot_freq)==0 )
-//         {
-//             domain_save ( iteration / snapshot_freq );
-//         }
-
-//         time_step_kernel<<<gridDim, blockDim>>>(d_U_prv, d_U_cur, d_U_nxt);
-
-//         cudaDeviceSynchronize();
-//         cudaMemcpy(h_U_cur, d_U_nxt, (M+2)*(N+2)*sizeof(real_t), cudaMemcpyDeviceToHost);
-//         cudaDeviceSynchronize();
-//         move_buffer_window(d_U_prv, d_U_cur, d_U_nxt);
-//     }
-// }
 void simulate(void) {
     dim3 blockDim(16, 16);
     dim3 gridDim((N + blockDim.x - 1) / blockDim.x, (M + blockDim.y - 1) / blockDim.y);
+    std::cout << "Block dimensions: " << blockDim.x << " x " << blockDim.y << std::endl;
+    std::cout << "Grid dimensions: " << gridDim.x << " x " << gridDim.y << std::endl;
 
     for (int_t iteration = 0; iteration <= max_iteration; iteration++) {
         if ((iteration % snapshot_freq) == 0) {
+            cudaMemcpy(h_U_cur, d_U_nxt, (M + 2) * (N + 2) * sizeof(real_t), cudaMemcpyDeviceToHost);
+            cudaDeviceSynchronize();
             domain_save(iteration / snapshot_freq);
         }
 
@@ -249,9 +181,7 @@ void simulate(void) {
         );
 
         cudaDeviceSynchronize();
-        cudaMemcpy(h_U_cur, d_U_nxt, (M + 2) * (N + 2) * sizeof(real_t), cudaMemcpyDeviceToHost);
-        cudaDeviceSynchronize();
-        move_buffer_window(d_U_prv, d_U_cur, d_U_nxt);
+        move_buffer_window();
     }
 }
 // END: T7
@@ -338,9 +268,15 @@ void domain_initialize ( void )
             h_U(i,j) = exp ( -4.0*delta*delta );
         }
     }
+    
 
     // Set the time step for 2D case
     dt = dx*dy / (c * sqrt (dx*dx+dy*dy));
+
+    std::cout << "Value of constant c: " << c << std::endl;
+    std::cout << "Value of constant dx: " << dx << std::endl;
+    std::cout << "Value of constant dy: " << dy << std::endl;
+    std::cout << "Value of constant dt: " << dt << std::endl;
 
     // Allocate device memory for the three time steps
     cudaErrorCheck(cudaMalloc((void **)&d_U_prv, (M+2)*(N+2)*sizeof(real_t)));
