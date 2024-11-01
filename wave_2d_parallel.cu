@@ -34,9 +34,9 @@ real_t *d_U_prv, *d_U_cur, *d_U_nxt;
 
 // Can't index past the ghost points, because device only allows
 // indexing with unsigned ints
-#define D_U_PRV(i,j) d_U_prv[((i+1))*(N+2)+(j+1)]
-#define D_U_CUR(i,j)     d_U_cur[((i+1))*(N+2)+(j+1)]
-#define D_U_NXT(i,j) d_U_nxt[((i+1))*(N+2)+(j+1)]
+#define D_U_PRV(i,j) d_U_prv[((i+1))*(d_N+2)+(j+1)]
+#define D_U_CUR(i,j)     d_U_cur[((i+1))*(d_N+2)+(j+1)]
+#define D_U_NXT(i,j) d_U_nxt[((i+1))*(d_N+2)+(j+1)]
 
 // Simulation parameters: size, step count, and how often to save the state
 int_t
@@ -61,6 +61,9 @@ __constant__ int_t d_N;
 __constant__ int_t d_M;
 
 __constant__ real_t d_dt, d_c, d_dx, d_dy;
+
+// dim3 blockDim(16, 16);
+// dim3 gridDim((N + blockDim.x - 1) / blockDim.x, (M + blockDim.y - 1) / blockDim.y);
 
 // We only need the current time step on the host side
 real_t *h_U_cur;
@@ -115,43 +118,43 @@ void domain_finalize ( void )
 }
 
 // TASK: T6
-__device__ void apply_boundary_conditions_global(real_t *d_U_cur, int global_i, int global_j, int N, int M) {
+// TASK: T6
+__device__ void apply_boundary_conditions_global(real_t *d_U_cur, int global_i, int global_j) {
     // Neumann (reflective) boundary condition
-     if (global_i < M && global_j < N) {
+     if (global_i < d_M && global_j < d_N) {
     if (global_j == 0) {
         D_U_CUR(global_i, global_j -1) = D_U_CUR(global_i, global_j + 1);
     }
-    if (global_j == N - 1) {
-        D_U_CUR(global_i, N) = D_U_CUR(global_i, N - 2);
+    if (global_j == d_N - 1) {
+        D_U_CUR(global_i, d_N) = D_U_CUR(global_i, d_N - 2);
     }
     if (global_i == 0) {
         D_U_CUR(global_i-1, global_j) = D_U_CUR(global_i+1, global_j);
     }
-    if (global_i == M - 1) {
-        D_U_CUR(M, global_j) = D_U_CUR(M - 2, global_j);
+    if (global_i == d_M - 1) {
+        D_U_CUR(d_M, global_j) = D_U_CUR(d_M - 2, global_j);
     }
     }
 }
+
 
 // END: T6
 
 
 
 // TASK: T5
-__global__ void time_step_kernel(real_t* d_U_prv, real_t* d_U_cur, real_t* d_U_nxt,
-                                 int N, int M, real_t dt, real_t c, real_t dx, real_t dy) {
+__global__ void time_step_kernel(real_t* d_U_prv, real_t* d_U_cur, real_t* d_U_nxt) {
 
     int global_i = blockIdx.x * blockDim.x + threadIdx.x;
     int global_j = blockIdx.y * blockDim.y + threadIdx.y;
 
     // Apply boundary conditions
-    apply_boundary_conditions_global(d_U_cur, global_i, global_j, N, M);
-    __syncthreads();
-
+    apply_boundary_conditions_global(d_U_cur, global_i, global_j);
+    cg::this_thread_block().sync();
     // Perform the time step calculation
-    if (global_i < M && global_j < N) {
+    if (global_i < d_M && global_j < d_N) {
         D_U_NXT(global_i, global_j) = -D_U_PRV(global_i, global_j) + 2.0 * D_U_CUR(global_i, global_j)
-            + (dt * dt * c * c) / (dx * dy) * (
+            + (d_dt * d_dt * d_c * d_c) / (d_dx * d_dy) * (
                 D_U_CUR(global_i-1, global_j) + D_U_CUR(global_i + 1, global_j) +
                 D_U_CUR(global_i, global_j-1) + D_U_CUR(global_i, global_j + 1) - 4.0 * D_U_CUR(global_i, global_j)
             );
@@ -164,20 +167,17 @@ __global__ void time_step_kernel(real_t* d_U_prv, real_t* d_U_cur, real_t* d_U_n
 void simulate(void) {
     dim3 blockDim(16, 16);
     dim3 gridDim((N + blockDim.x - 1) / blockDim.x, (M + blockDim.y - 1) / blockDim.y);
-    std::cout << "Block dimensions: " << blockDim.x << " x " << blockDim.y << std::endl;
-    std::cout << "Grid dimensions: " << gridDim.x << " x " << gridDim.y << std::endl;
 
     for (int_t iteration = 0; iteration <= max_iteration; iteration++) {
         if ((iteration % snapshot_freq) == 0) {
-            cudaMemcpy(h_U_cur, d_U_nxt, (M + 2) * (N + 2) * sizeof(real_t), cudaMemcpyDeviceToHost);
+            cudaMemcpy(h_U_cur, d_U_cur, (M + 2) * (N + 2) * sizeof(real_t), cudaMemcpyDeviceToHost);
             cudaDeviceSynchronize();
             domain_save(iteration / snapshot_freq);
         }
 
         // Launch the kernel with constants as arguments
         time_step_kernel<<<gridDim, blockDim>>>(
-            d_U_prv, d_U_cur, d_U_nxt,
-            N, M, dt, c, dx, dy
+            d_U_prv, d_U_cur, d_U_nxt
         );
 
         cudaDeviceSynchronize();
@@ -272,11 +272,6 @@ void domain_initialize ( void )
 
     // Set the time step for 2D case
     dt = dx*dy / (c * sqrt (dx*dx+dy*dy));
-
-    std::cout << "Value of constant c: " << c << std::endl;
-    std::cout << "Value of constant dx: " << dx << std::endl;
-    std::cout << "Value of constant dy: " << dy << std::endl;
-    std::cout << "Value of constant dt: " << dt << std::endl;
 
     // Allocate device memory for the three time steps
     cudaErrorCheck(cudaMalloc((void **)&d_U_prv, (M+2)*(N+2)*sizeof(real_t)));

@@ -12,7 +12,7 @@ dirs:
 sequential: ${SEQUENTIAL_SRC_FILES}
 	$(CC) $^ $(CFLAGS) -o $@ $(LDLIBS)
 parallel: ${PARALLEL_SRC_FILES}
-	$(PARALLEL_CC) $^ -O2 -o $@ $(LDLIBS)
+	$(PARALLEL_CC) $^ -O2 -fmad=false -o $@ $(LDLIBS)
 plot: ${IMAGES}
 images/%.png: data/%.dat
 	./plot_image.sh $<
