@@ -32,11 +32,16 @@ cudaDeviceProp device_prop;
 // Device buffers for three time steps, indexed with 2 ghost points for the boundary
 real_t *d_U_prv, *d_U_cur, *d_U_nxt;
 
+#define BLOCK_SIZE_X 16
+#define BLOCK_SIZE_Y 16
+
 // Can't index past the ghost points, because device only allows
 // indexing with unsigned ints
 #define D_U_PRV(i,j) d_U_prv[((i+1))*(d_N+2)+(j+1)]
 #define D_U_CUR(i,j)     d_U_cur[((i+1))*(d_N+2)+(j+1)]
 #define D_U_NXT(i,j) d_U_nxt[((i+1))*(d_N+2)+(j+1)]
+
+#define SHARED_U(i,j) shared_U[(i+1)*(BLOCK_SIZE_Y+2)+(j+1)]
 
 // Simulation parameters: size, step count, and how often to save the state
 int_t
@@ -119,20 +124,31 @@ void domain_finalize ( void )
 
 // TASK: T6
 // TASK: T6
-__device__ void apply_boundary_conditions_global(real_t *d_U_cur, int global_i, int global_j) {
+__device__ void apply_boundary_conditions_global(real_t *d_U_cur, real_t* shared_U) {
+
+    int global_i = blockIdx.x * blockDim.x + threadIdx.x;
+    int global_j = blockIdx.y * blockDim.y + threadIdx.y;
+
+    int local_i = threadIdx.x;
+    int local_j = threadIdx.y;
+
     // Neumann (reflective) boundary condition
      if (global_i < d_M && global_j < d_N) {
     if (global_j == 0) {
-        D_U_CUR(global_i, global_j -1) = D_U_CUR(global_i, global_j + 1);
+        SHARED_U(local_i, local_j-1) = D_U_CUR(global_i, global_j + 1);
+        // D_U_CUR(global_i, global_j -1) = D_U_CUR(global_i, global_j + 1);
     }
     if (global_j == d_N - 1) {
-        D_U_CUR(global_i, d_N) = D_U_CUR(global_i, d_N - 2);
+        SHARED_U(local_i, local_j+1) = D_U_CUR(global_i, global_j - 1);
+        // D_U_CUR(global_i, d_N) = D_U_CUR(global_i, d_N - 2);
     }
     if (global_i == 0) {
-        D_U_CUR(global_i-1, global_j) = D_U_CUR(global_i+1, global_j);
+        SHARED_U(local_i-1, local_j) = D_U_CUR(global_i+1, global_j);
+        // D_U_CUR(global_i-1, global_j) = D_U_CUR(global_i+1, global_j);
     }
     if (global_i == d_M - 1) {
-        D_U_CUR(d_M, global_j) = D_U_CUR(d_M - 2, global_j);
+        SHARED_U(local_i+1, local_j) = D_U_CUR(global_i-1, global_j);
+        // D_U_CUR(d_M, global_j) = D_U_CUR(d_M - 2, global_j);
     }
     }
 }
@@ -145,18 +161,48 @@ __device__ void apply_boundary_conditions_global(real_t *d_U_cur, int global_i, 
 // TASK: T5
 __global__ void time_step_kernel(real_t* d_U_prv, real_t* d_U_cur, real_t* d_U_nxt) {
 
+    __shared__ real_t shared_U[(BLOCK_SIZE_X+2)*(BLOCK_SIZE_Y+2)];
+    
     int global_i = blockIdx.x * blockDim.x + threadIdx.x;
     int global_j = blockIdx.y * blockDim.y + threadIdx.y;
 
-    // Apply boundary conditions
-    apply_boundary_conditions_global(d_U_cur, global_i, global_j);
+    int local_i = threadIdx.x;
+    int local_j = threadIdx.y;
+
+    // Load the current time step into shared memory
+    if (global_i < d_M && global_j < d_N) {
+        SHARED_U(local_i, local_j) = D_U_CUR(global_i, global_j);
+    
+        // Load the ghost points for boirder blocks that are not global boundaries
+        if (local_i == 0 && global_i > 0) {
+            SHARED_U(local_i-1, local_j) = D_U_CUR(global_i-1, global_j);
+        }
+        if (local_i == blockDim.x - 1 && global_i < d_M - 1) {
+            SHARED_U(local_i+1, local_j) = D_U_CUR(global_i+1, global_j);
+        }
+        if (local_j == 0 && global_j > 0) {
+            SHARED_U(local_i, local_j-1) = D_U_CUR(global_i, global_j-1);
+        }
+        if (local_j == blockDim.y - 1 && global_j < d_N - 1) {
+            SHARED_U(local_i, local_j+1) = D_U_CUR(global_i, global_j+1);
+        }
+
+        // Apply boundary conditions for the global boundaries
+        apply_boundary_conditions_global(d_U_cur, shared_U);
+    
+    }
+
     cg::this_thread_block().sync();
+
+
     // Perform the time step calculation
     if (global_i < d_M && global_j < d_N) {
-        D_U_NXT(global_i, global_j) = -D_U_PRV(global_i, global_j) + 2.0 * D_U_CUR(global_i, global_j)
+        D_U_NXT(global_i, global_j) = -D_U_PRV(global_i, global_j) + 2.0 * SHARED_U(local_i, local_j)
             + (d_dt * d_dt * d_c * d_c) / (d_dx * d_dy) * (
-                D_U_CUR(global_i-1, global_j) + D_U_CUR(global_i + 1, global_j) +
-                D_U_CUR(global_i, global_j-1) + D_U_CUR(global_i, global_j + 1) - 4.0 * D_U_CUR(global_i, global_j)
+                SHARED_U(local_i-1,local_j) + SHARED_U(local_i+1,local_j)
+                + SHARED_U(local_i,local_j-1) + SHARED_U(local_i,local_j+1)
+                - 4.0 * SHARED_U(local_i,local_j)
+
             );
     }
     __syncthreads();
@@ -165,8 +211,8 @@ __global__ void time_step_kernel(real_t* d_U_prv, real_t* d_U_cur, real_t* d_U_n
 
 // TASK: T7
 void simulate(void) {
-    dim3 blockDim(16, 16);
-    dim3 gridDim((N + blockDim.x - 1) / blockDim.x, (M + blockDim.y - 1) / blockDim.y);
+    dim3 blockDim(BLOCK_SIZE_X, BLOCK_SIZE_Y);
+    dim3 gridDim((N + BLOCK_SIZE_X - 1) / BLOCK_SIZE_X, (M + BLOCK_SIZE_Y - 1) / BLOCK_SIZE_Y);
 
     for (int_t iteration = 0; iteration <= max_iteration; iteration++) {
         if ((iteration % snapshot_freq) == 0) {
@@ -176,9 +222,14 @@ void simulate(void) {
         }
 
         // Launch the kernel with constants as arguments
-        time_step_kernel<<<gridDim, blockDim>>>(
-            d_U_prv, d_U_cur, d_U_nxt
-        );
+        void* kernel_args[] = { (void*)&d_U_prv, (void*)&d_U_cur, (void*)&d_U_nxt };
+        
+       cudaErrorCheck(cudaLaunchCooperativeKernel(
+            (void*)time_step_kernel,
+            gridDim,
+            blockDim,
+            kernel_args
+        ));
 
         cudaDeviceSynchronize();
         move_buffer_window();
