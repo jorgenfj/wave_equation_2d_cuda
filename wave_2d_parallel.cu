@@ -64,6 +64,7 @@ real_t
 // to use more CUDA features.
 __constant__ int_t d_N;
 __constant__ int_t d_M;
+__constant__ int_t d_snapshot_freq;
 
 __constant__ real_t d_dt, d_c, d_dx, d_dy;
 
@@ -91,6 +92,16 @@ void move_buffer_window( void ) {
     d_U_cur = d_U_nxt;
     d_U_nxt = temp;
 }
+
+__device__ void move_buffer_window_device(real_t** U_prv, real_t** U_cur, real_t** U_nxt) {
+    // Ensure only one thread performs the buffer swap
+    real_t* temp = *U_prv;
+    *U_prv = *U_cur;
+    *U_cur = *U_nxt;
+    *U_nxt = temp;
+}
+
+
 
 
 // Save the present time step in a numbered file under 'data/'
@@ -169,43 +180,52 @@ __global__ void time_step_kernel(real_t* d_U_prv, real_t* d_U_cur, real_t* d_U_n
     int local_i = threadIdx.x;
     int local_j = threadIdx.y;
 
-    // Load the current time step into shared memory
-    if (global_i < d_M && global_j < d_N) {
-        SHARED_U(local_i, local_j) = D_U_CUR(global_i, global_j);
-    
-        // Load the ghost points for boirder blocks that are not global boundaries
-        if (local_i == 0 && global_i > 0) {
-            SHARED_U(local_i-1, local_j) = D_U_CUR(global_i-1, global_j);
-        }
-        if (local_i == blockDim.x - 1 && global_i < d_M - 1) {
-            SHARED_U(local_i+1, local_j) = D_U_CUR(global_i+1, global_j);
-        }
-        if (local_j == 0 && global_j > 0) {
-            SHARED_U(local_i, local_j-1) = D_U_CUR(global_i, global_j-1);
-        }
-        if (local_j == blockDim.y - 1 && global_j < d_N - 1) {
-            SHARED_U(local_i, local_j+1) = D_U_CUR(global_i, global_j+1);
+    // Loop over the number of time steps to take
+    for (int iter = 0; iter < d_snapshot_freq; ++iter) {
+        // Load the current time step into shared memory
+        if (global_i < d_M && global_j < d_N) {
+            SHARED_U(local_i, local_j) = D_U_CUR(global_i, global_j);
+        
+            // Load the ghost points for boirder blocks that are not global boundaries
+            if (local_i == 0 && global_i > 0) {
+                SHARED_U(local_i-1, local_j) = D_U_CUR(global_i-1, global_j);
+            }
+            if (local_i == blockDim.x - 1 && global_i < d_M - 1) {
+                SHARED_U(local_i+1, local_j) = D_U_CUR(global_i+1, global_j);
+            }
+            if (local_j == 0 && global_j > 0) {
+                SHARED_U(local_i, local_j-1) = D_U_CUR(global_i, global_j-1);
+            }
+            if (local_j == blockDim.y - 1 && global_j < d_N - 1) {
+                SHARED_U(local_i, local_j+1) = D_U_CUR(global_i, global_j+1);
+            }
+
+            // Apply boundary conditions for the global boundaries
+            apply_boundary_conditions_global(d_U_cur, shared_U);
+        
+        // Only need to synchronize within the block here
+        cg::this_thread_block().sync();
+
+        // Perform the time step calculation
+        if (global_i < d_M && global_j < d_N) {
+            D_U_NXT(global_i, global_j) = -D_U_PRV(global_i, global_j) + 2.0 * SHARED_U(local_i, local_j)
+                + (d_dt * d_dt * d_c * d_c) / (d_dx * d_dy) * (
+                    SHARED_U(local_i-1,local_j) + SHARED_U(local_i+1,local_j)
+                    + SHARED_U(local_i,local_j-1) + SHARED_U(local_i,local_j+1)
+                    - 4.0 * SHARED_U(local_i,local_j)
+
+                );
         }
 
-        // Apply boundary conditions for the global boundaries
-        apply_boundary_conditions_global(d_U_cur, shared_U);
-    
+        // Move the buffer window
+        move_buffer_window_device(&d_U_prv, &d_U_cur, &d_U_nxt);
+
+        // Synchronize before next iteration
+        cg::grid_group grid = cg::this_grid();
+        grid.sync();
+        }
+
     }
-
-    cg::this_thread_block().sync();
-
-
-    // Perform the time step calculation
-    if (global_i < d_M && global_j < d_N) {
-        D_U_NXT(global_i, global_j) = -D_U_PRV(global_i, global_j) + 2.0 * SHARED_U(local_i, local_j)
-            + (d_dt * d_dt * d_c * d_c) / (d_dx * d_dy) * (
-                SHARED_U(local_i-1,local_j) + SHARED_U(local_i+1,local_j)
-                + SHARED_U(local_i,local_j-1) + SHARED_U(local_i,local_j+1)
-                - 4.0 * SHARED_U(local_i,local_j)
-
-            );
-    }
-    __syncthreads();
 }
 // END: T5
 
@@ -214,26 +234,26 @@ void simulate(void) {
     dim3 blockDim(BLOCK_SIZE_X, BLOCK_SIZE_Y);
     dim3 gridDim((N + BLOCK_SIZE_X - 1) / BLOCK_SIZE_X, (M + BLOCK_SIZE_Y - 1) / BLOCK_SIZE_Y);
 
-    for (int_t iteration = 0; iteration <= max_iteration; iteration++) {
-        if ((iteration % snapshot_freq) == 0) {
-            cudaMemcpy(h_U_cur, d_U_cur, (M + 2) * (N + 2) * sizeof(real_t), cudaMemcpyDeviceToHost);
-            cudaDeviceSynchronize();
-            domain_save(iteration / snapshot_freq);
-        }
+    for (int_t iteration = 0; iteration <= max_iteration; iteration += snapshot_freq) {
+        cudaMemcpy(h_U_cur, d_U_cur, (M + 2) * (N + 2) * sizeof(real_t), cudaMemcpyDeviceToHost);
+        domain_save(iteration / snapshot_freq);
 
-        // Launch the kernel with constants as arguments
-        void* kernel_args[] = { (void*)&d_U_prv, (void*)&d_U_cur, (void*)&d_U_nxt };
-        
-       cudaErrorCheck(cudaLaunchCooperativeKernel(
+        void* kernel_args[] = { (void*)&d_U_prv, (void*)&d_U_cur, (void*)&d_U_nxt, (void*)&snapshot_freq };
+        cudaErrorCheck(cudaLaunchCooperativeKernel(
             (void*)time_step_kernel,
             gridDim,
             blockDim,
             kernel_args
         ));
 
-        cudaDeviceSynchronize();
-        move_buffer_window();
+        // Swap the buffers on host side to reflect the changes on the device
+        for (int i = 0; i < snapshot_freq % 3; ++i) {
+            move_buffer_window();
+        }
+
     }
+
+
 }
 // END: T7
 
@@ -244,7 +264,25 @@ void simulate(void) {
 void occupancy( void )
 {
 // BEGIN: T8
-    ;
+    cudaDeviceProp deviceProp;
+    cudaErrorCheck(cudaGetDeviceProperties(&deviceProp, 0));
+    real_t shared_mem_size = (BLOCK_SIZE_X+2)*(BLOCK_SIZE_Y+2)*sizeof(real_t);
+    dim3 blockDim(BLOCK_SIZE_X, BLOCK_SIZE_Y);
+    dim3 gridDim((N + BLOCK_SIZE_X - 1) / BLOCK_SIZE_X, (M + BLOCK_SIZE_Y - 1) / BLOCK_SIZE_Y);
+
+    int maxActiveBlocks;
+    cudaErrorCheck(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+        &maxActiveBlocks, (void *)time_step_kernel, BLOCK_SIZE_X * BLOCK_SIZE_Y, shared_mem_size
+    ));
+
+    int maxWarpsPerMultiprocessor = deviceProp.maxThreadsPerMultiProcessor / deviceProp.warpSize;
+    int activeWarps = maxActiveBlocks * (BLOCK_SIZE_X * BLOCK_SIZE_Y / deviceProp.warpSize);
+
+    float occupancy = (float)activeWarps / maxWarpsPerMultiprocessor;
+
+    printf("Grid size set to:             %d.\n", gridDim.x * gridDim.y * gridDim.z);
+    printf("Launched blocks of size:      %d.\n", blockDim.x * blockDim.y * blockDim.z);
+    printf("Theoretical occupancy:        %f\n", occupancy);
 // END: T8
 }
 
@@ -342,6 +380,7 @@ void domain_initialize ( void )
     cudaErrorCheck(cudaMemcpyToSymbol(d_c, &c, sizeof(real_t)));
     cudaErrorCheck(cudaMemcpyToSymbol(d_dx, &dx, sizeof(real_t)));
     cudaErrorCheck(cudaMemcpyToSymbol(d_dy, &dy, sizeof(real_t)));
+    cudaErrorCheck(cudaMemcpyToSymbol(d_snapshot_freq, &snapshot_freq, sizeof(int_t)));
 
 // END: T3
 }
